@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""coolpc - 原價屋 (coolpc.com.tw) price list from the shell.
+
+Reads the public 估價單 page (evaluate.php): every product, its current price,
+酷幣 rebate, any price drop, and its sub-group. Search it, list a category,
+or total up a quote. Read-only, no login, zero dependencies (Python 3.8+).
+
+How the page is built (verified 2026-11-01): Big5 (cp950) HTML with 30
+<SELECT name=nN> boxes, one per category. Option `value=i` indexes the JS
+arrays cN=[...] (current price) and dN=[...] (酷幣 rebate). Option text is
+"name, $price tags" or "name, $old↘$new tags" for a drop.
+
+  dN is NOT a discount. "$4950 ↓酷幣200↓" costs 4950 and returns 200 coins;
+  subtracting it, as the coolpc skill's scraper did, understates the price.
+
+Item ids look like "n4-31" (category box 4, option 31). They are positions on
+today's page and can shift when coolpc edits it, so `quote` prints the name
+back next to each id.
+"""
+from __future__ import annotations
+
+import argparse
+import html as htmllib
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+
+URL = "https://coolpc.com.tw/evaluate.php"
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                     "coolpc", "catalog.json")
+TTL = 30 * 60  # ponytail: fixed 30 min; make it a flag if anyone needs fresher than that
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+
+EX_OK, EX_ERR, EX_USAGE, EX_NET = 0, 1, 2, 4
+
+# A price you only get when buying a whole build (or with a board) is not
+# what one part costs, so search hides these unless --bundle.
+BUNDLE = re.compile(r"搭機價|任搭")
+
+
+class NetError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- parsing
+def _array(page, name):
+    m = re.search(r"\b%s\s*=\s*\[([^\]]*)\]" % re.escape(name), page)
+    if not m:
+        return []
+    out = []
+    for tok in m.group(1).split(","):
+        try:
+            out.append(int(float(tok)))
+        except ValueError:
+            out.append(0)
+    return out
+
+
+def parse(page):
+    """HTML text -> list of item dicts. Pure, so it is testable offline."""
+    items = []
+    for sel in re.finditer(r"<SELECT[^>]*\bname=n(\d+)\b[^>]*>(.*?)</SELECT>",
+                           page, re.S | re.I):
+        n, body = int(sel.group(1)), sel.group(2)
+        before = page[max(0, sel.start() - 500):sel.start()]
+        label = re.findall(r"<TD[^>]+class=t[^>]*>([^<]{2,50})", before, re.I)
+        category = label[-1].strip() if label else "n%d" % n
+        prices, coins = _array(page, "c%d" % n), _array(page, "d%d" % n)
+        group = ""
+        for tag in re.finditer(r"<(OPTGROUP|OPTION)([^>]*)>([^<]*)", body, re.I):
+            kind, attrs, text = tag.group(1).upper(), tag.group(2), tag.group(3)
+            if kind == "OPTGROUP":
+                g = re.search(r"label\s*=\s*['\"]?([^'\">]+)", attrs, re.I)
+                group = g.group(1).strip() if g else ""
+                continue
+            v = re.search(r"value\s*=\s*(\d+)", attrs, re.I)
+            if "disabled" in attrs.lower() or not v or v.group(1) == "0":
+                continue  # promo notes and the "共有商品 N 樣" header
+            i = int(v.group(1))
+            text = htmllib.unescape(text).strip()
+            # The price sits after the LAST ", $"; names can contain commas.
+            m = re.match(r"(.*),\s*\$(\d+)(?:↘\$(\d+))?\s*(.*)$", text, re.S)
+            if not m:
+                continue
+            name, shown, after, tags = m.groups()
+            price = prices[i] if i < len(prices) and prices[i] else int(after or shown)
+            items.append({
+                "id": "n%d-%d" % (n, i),
+                "category": category,
+                "group": group,
+                "name": name.strip(),
+                "price": price,
+                "was": int(shown) if after else None,
+                "coins": coins[i] if i < len(coins) else 0,
+                "bundle": bool(BUNDLE.search(name)),
+                "tags": tags.strip(),
+            })
+    return items
+
+
+# -------------------------------------------------------------- fetching
+def fetch():
+    req = urllib.request.Request(URL, headers={
+        "User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise NetError("cannot reach coolpc.com.tw: {}".format(getattr(e, "reason", e)))
+    return raw.decode("cp950", "replace")  # strict big5 breaks on ~80 chars
+
+
+def catalog(refresh=False):
+    if not refresh:
+        try:
+            with open(CACHE, encoding="utf-8") as fh:
+                c = json.load(fh)
+            if time.time() - c["fetched_at"] < TTL:
+                return c
+        except (OSError, ValueError, KeyError):
+            pass
+    items = parse(fetch())
+    if len(items) < 100:  # the page changed shape; don't cache garbage
+        raise ValueError("parsed only {} items - evaluate.php changed its layout"
+                         .format(len(items)))
+    c = {"fetched_at": int(time.time()), "items": items}
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    tmp = CACHE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(c, fh, ensure_ascii=False)
+    os.replace(tmp, CACHE)
+    return c
+
+
+# -------------------------------------------------------------- commands
+def search(items, words=(), category=None, group=None, lo=None, hi=None,
+           bundle=False, sort="price"):
+    words = [w.lower() for w in words]
+    out = [it for it in items
+           if all(w in it["name"].lower() for w in words)
+           and (not category or category.lower() in it["category"].lower())
+           and (not group or group.lower() in it["group"].lower())
+           and (lo is None or it["price"] >= lo)
+           and (hi is None or it["price"] <= hi)
+           and (bundle or not it["bundle"])]
+    if sort == "price":
+        out.sort(key=lambda it: it["price"])
+    elif sort == "price-desc":
+        out.sort(key=lambda it: -it["price"])
+    return out  # sort == "page": coolpc's own order
+
+
+def cmd_search(args):
+    c = catalog(args.refresh)
+    hits = search(c["items"], args.words, args.category, args.group,
+                  args.min, args.max, args.bundle, args.sort)
+    return {"total": len(hits), "fetched_at": c["fetched_at"],
+            "items": hits[:args.limit] if args.limit else hits}
+
+
+def cmd_categories(args):
+    counts = {}
+    for it in catalog(args.refresh)["items"]:
+        counts[it["category"]] = counts.get(it["category"], 0) + 1
+    return [{"category": k, "items": v} for k, v in counts.items()]
+
+
+def cmd_quote(args):
+    by_id = {it["id"]: it for it in catalog(args.refresh)["items"]}
+    missing = [i for i in args.ids if i not in by_id]
+    if missing:
+        raise ValueError("unknown id(s): {} - ids come from `coolpc search`"
+                         .format(", ".join(missing)))
+    picked = [by_id[i] for i in args.ids]
+    return {"items": picked, "total": sum(it["price"] for it in picked),
+            "coins": sum(it["coins"] for it in picked), "url": URL}
+
+
+# ---------------------------------------------------------------- output
+def _w(s):
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
+
+
+def _cut(s, width):
+    """Truncate/pad to a terminal width, counting CJK as two columns."""
+    out, used = "", 0
+    for ch in s:
+        cw = _w(ch)
+        if used + cw > width - (1 if _w(s) > width else 0):
+            return out + "…" + " " * (width - used - 1)
+        out, used = out + ch, used + cw
+    return out + " " * (width - used)
+
+
+def _rows(items):
+    for it in items:
+        was = "{:,}↘".format(it["was"]) if it["was"] else ""
+        coin = "+{}幣".format(it["coins"]) if it["coins"] else ""
+        print("{:<8} {:>9} {:>7} {:>7}  {}".format(
+            it["id"], was, "{:,}".format(it["price"]), coin, _cut(it["name"], 70).rstrip()))
+
+
+def human(cmd, data):
+    if cmd == "search":
+        print("{} items (showing {})".format(data["total"], len(data["items"])))
+        _rows(data["items"])
+    elif cmd == "categories":
+        for r in data:
+            print("{:>5}  {}".format(r["items"], r["category"]))
+    elif cmd == "quote":
+        _rows(data["items"])
+        print("{:<8} {:>9} {:>7} {:>7}  合計".format(
+            "", "", "{:,}".format(data["total"]),
+            "+{}幣".format(data["coins"]) if data["coins"] else ""))
+        print("\n估價單沒有可分享的網址；到 {} 依上面的品項選好即可。".format(data["url"]))
+
+
+# ------------------------------------------------------------------ main
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        payload = {"ok": False, "error": {"message": "{}: {}".format(self.prog, message),
+                                          "code": EX_USAGE}}
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            self.print_usage(sys.stderr)
+            print("error: " + message, file=sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def build_parser():
+    # Accepted before or after the subcommand. SUPPRESS stops the subcommand's
+    # copy from resetting a flag given up front back to False.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable envelope")
+    common.add_argument("--refresh", action="store_true", default=argparse.SUPPRESS,
+                        help="re-download now instead of using the 30-min cache")
+    p = Parser(prog="coolpc", parents=[common],
+               description="原價屋 price list from the shell (read-only).")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    s = sub.add_parser("search", parents=[common], help="search by keywords (all must match)")
+    s.add_argument("words", nargs="*", help="e.g. 2TB Gen4; none = whole category")
+    s.add_argument("-c", "--category", help="substring of the category, e.g. SSD, CPU, 顯示卡")
+    s.add_argument("-g", "--group", help="substring of the sub-group inside a category")
+    s.add_argument("--min", type=int)
+    s.add_argument("--max", type=int)
+    s.add_argument("--sort", choices=("price", "price-desc", "page"), default="price")
+    s.add_argument("--limit", type=int, default=20, help="0 = all")
+    s.add_argument("--bundle", action="store_true",
+                   help="include 搭機價 / 任搭 prices (only valid with a build)")
+    sub.add_parser("categories", parents=[common], help="categories and item counts")
+    q = sub.add_parser("quote", parents=[common], help="total up a list of item ids")
+    q.add_argument("ids", nargs="+", metavar="id", help="e.g. n4-31 n5-12")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    args.json = getattr(args, "json", False)
+    args.refresh = getattr(args, "refresh", False)
+    try:
+        data = {"search": cmd_search, "categories": cmd_categories,
+                "quote": cmd_quote}[args.cmd](args)
+        payload, code = {"ok": True, "data": data}, EX_OK
+    except NetError as e:
+        payload, code = {"ok": False, "error": {"message": str(e), "code": EX_NET}}, EX_NET
+    except ValueError as e:
+        payload, code = {"ok": False, "error": {"message": str(e), "code": EX_ERR}}, EX_ERR
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload["ok"]:
+        human(args.cmd, payload["data"])
+    else:
+        print("error: " + payload["error"]["message"], file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
